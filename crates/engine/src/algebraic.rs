@@ -125,9 +125,29 @@ pub fn mine_invariants(summaries: &[FunctionSummary]) -> Vec<AlgebraicInvariant>
     invariants.extend(mine_product_invariants(summaries));
     invariants.extend(mine_mapping_patterns(summaries));
     invariants.extend(mine_overwrite_patterns(summaries));
+    invariants.extend(mine_bidirectional_slots(summaries));
 
     // Z3 verification pass
     verify_with_z3(&mut invariants, summaries);
+
+    // Dedup: remove potential_conservation where a conservation or
+    // zero_sum_transfer already covers the same function.
+    let strong_functions: HashSet<String> = invariants
+        .iter()
+        .filter(|i| i.name == "conservation" || i.name == "zero_sum_transfer")
+        .flat_map(|i| i.supporting_functions.clone())
+        .collect();
+    invariants.retain(|i| {
+        if i.name == "potential_conservation" {
+            // Keep only if none of its supporting functions are already
+            // covered by a stronger invariant.
+            !i.supporting_functions
+                .iter()
+                .any(|f| strong_functions.contains(f))
+        } else {
+            true
+        }
+    });
 
     invariants
 }
@@ -154,7 +174,9 @@ fn mine_conservation(summaries: &[FunctionSummary]) -> Vec<AlgebraicInvariant> {
                             description: format!(
                                 "Slots {} and {} change by opposite amounts in {} \
                                  — their sum is conserved.",
-                                da.slot.0, db.slot.0, summary.name
+                                humanize_slot(&da.slot.0),
+                                humanize_slot(&db.slot.0),
+                                summary.name
                             ),
                             property: None,
                             confidence: AlgebraicConfidence::Likely,
@@ -243,7 +265,7 @@ fn mine_monotonicity(summaries: &[FunctionSummary]) -> Vec<AlgebraicInvariant> {
                 name: "monotonic_increase".to_string(),
                 description: format!(
                     "Slot {} only increases (never decreases) across functions: {}",
-                    truncate(slot),
+                    humanize_slot(slot),
                     functions.join(", ")
                 ),
                 property: None,
@@ -256,7 +278,7 @@ fn mine_monotonicity(summaries: &[FunctionSummary]) -> Vec<AlgebraicInvariant> {
                 name: "monotonic_decrease".to_string(),
                 description: format!(
                     "Slot {} only decreases (never increases) across functions: {}",
-                    truncate(slot),
+                    humanize_slot(slot),
                     functions.join(", ")
                 ),
                 property: None,
@@ -292,7 +314,7 @@ fn mine_bounded_change(summaries: &[FunctionSummary]) -> Vec<AlgebraicInvariant>
                                 description: format!(
                                     "Slot {} always changes by exactly {} in {}. \
                                      Counter or index pattern.",
-                                    truncate(&delta.slot.0),
+                                    humanize_slot(&delta.slot.0),
                                     val,
                                     summary.name
                                 ),
@@ -407,8 +429,8 @@ fn mine_product_invariants(summaries: &[FunctionSummary]) -> Vec<AlgebraicInvari
                          If this product must be preserved (AMM invariant), \
                          any function changing one slot without adjusting the other breaks it.",
                         summary.name,
-                        truncate(slot_a),
-                        truncate(slot_b)
+                        humanize_slot(slot_a),
+                        humanize_slot(slot_b)
                     ),
                     property: None,
                     confidence: AlgebraicConfidence::Candidate,
@@ -429,8 +451,8 @@ fn mine_product_invariants(summaries: &[FunctionSummary]) -> Vec<AlgebraicInvari
                             "{} has a constraint involving product of slots {} and {}. \
                              Likely AMM constant-product or collateral ratio invariant.",
                             summary.name,
-                            truncate(slot_a),
-                            truncate(slot_b)
+                            humanize_slot(slot_a),
+                            humanize_slot(slot_b)
                         ),
                         property: None,
                         confidence: AlgebraicConfidence::Likely,
@@ -543,7 +565,7 @@ fn mine_mapping_patterns(summaries: &[FunctionSummary]) -> Vec<AlgebraicInvarian
                 description: format!(
                     "Storage mapping at base {} has {} distinct entries accessed across \
                      functions: {}. Likely a balances/allowances mapping.",
-                    truncate(base),
+                    humanize_slot(base),
                     unique_slots.len(),
                     functions.into_iter().collect::<Vec<_>>().join(", ")
                 ),
@@ -580,6 +602,55 @@ fn extract_mapping_base(slot_expr: &Expr) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Detect slots that increase in some functions and decrease in others.
+/// This is a deposit/withdraw pattern -- the slot is a balance.
+fn mine_bidirectional_slots(summaries: &[FunctionSummary]) -> Vec<AlgebraicInvariant> {
+    let mut invariants = Vec::new();
+
+    // Track per-slot: which functions increase it, which decrease it
+    let mut slot_directions: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
+
+    for summary in summaries {
+        let deltas = extract_deltas(summary);
+        for d in &deltas {
+            let entry = slot_directions
+                .entry(d.slot.0.clone())
+                .or_insert_with(|| (Vec::new(), Vec::new()));
+
+            match &d.delta {
+                Some(Expr::Sub(zero, _)) if matches!(**zero, Expr::Lit(z) if z == [0u8; 32]) => {
+                    entry.1.push(summary.name.clone()); // decreasers
+                }
+                Some(_) => {
+                    entry.0.push(summary.name.clone()); // increasers
+                }
+                None => {} // overwrite -- skip
+            }
+        }
+    }
+
+    for (slot, (increasers, decreasers)) in &slot_directions {
+        if !increasers.is_empty() && !decreasers.is_empty() {
+            invariants.push(AlgebraicInvariant {
+                name: "bidirectional_balance".to_string(),
+                description: format!(
+                    "Slot {} is a balance: increased by {} and decreased by {}. \
+                     Deposit/withdraw pattern — verify that withdrawals cannot exceed deposits.",
+                    humanize_slot(slot),
+                    increasers.join(", "),
+                    decreasers.join(", ")
+                ),
+                property: None,
+                confidence: AlgebraicConfidence::Likely,
+                violators: vec![],
+                supporting_functions: [increasers.clone(), decreasers.clone()].concat(),
+            });
+        }
+    }
+
+    invariants
 }
 
 /// Verify mined invariants using Z3.
@@ -676,7 +747,7 @@ fn verify_product(
         let deltas = extract_deltas(summary);
         let mut writes_mentioned_slot = false;
         for delta in &deltas {
-            if inv.description.contains(&truncate(&delta.slot.0)) {
+            if inv.description.contains(&humanize_slot(&delta.slot.0)) {
                 writes_mentioned_slot = true;
             }
         }
@@ -729,7 +800,7 @@ fn mine_overwrite_patterns(summaries: &[FunctionSummary]) -> Vec<AlgebraicInvari
                     description: format!(
                         "Slot {} is overwritten by {} functions with identical \
                          expression structure. Consistent update pattern.",
-                        truncate(slot),
+                        humanize_slot(slot),
                         overwrites.len()
                     ),
                     property: None,
@@ -744,7 +815,7 @@ fn mine_overwrite_patterns(summaries: &[FunctionSummary]) -> Vec<AlgebraicInvari
                     description: format!(
                         "Slot {} is overwritten by {} functions with {} different \
                          expression patterns. Inconsistent update logic may indicate a bug.",
-                        truncate(slot),
+                        humanize_slot(slot),
                         overwrites.len(),
                         expr_shapes.len()
                     ),
@@ -864,7 +935,7 @@ pub fn mine_cross_function_conservation(summaries: &[FunctionSummary]) -> Vec<Al
                 description: format!(
                     "Slot {} is incrementally updated by {} but completely \
                      overwritten by {}. The overwriters may break an accumulator invariant.",
-                    truncate(slot),
+                    humanize_slot(slot),
                     has_delta.join(", "),
                     no_delta.join(", ")
                 ),
@@ -895,59 +966,107 @@ fn truncate(s: &str) -> String {
     }
 }
 
+/// Produce a human-readable name for a storage slot expression.
+///
+/// - `Keccak256(Var("sha3_input@NNN"))` -> `mapping_entry@NNN`
+/// - `Var("sha3_input@NNN")` -> `hash@NNN`
+/// - `Lit([0, 0, ..., N])` -> `direct_slot`
+/// - Everything else is truncated.
+fn humanize_slot(slot_id: &str) -> String {
+    // Keccak256(Var("sha3_input@256")) -> mapping_entry@256
+    if slot_id.contains("Keccak256") {
+        if let Some(at_pos) = slot_id.rfind('@') {
+            let num: String = slot_id[at_pos + 1..]
+                .chars()
+                .take_while(|c| c.is_numeric())
+                .collect();
+            if !num.is_empty() {
+                return format!("mapping_entry@{}", num);
+            }
+        }
+        return "mapping_entry".to_string();
+    }
+    // Var("sha3_input@NNN") -> hash@NNN
+    if slot_id.contains("sha3_input@") {
+        if let Some(at_pos) = slot_id.rfind('@') {
+            let num: String = slot_id[at_pos + 1..]
+                .chars()
+                .take_while(|c| c.is_numeric())
+                .collect();
+            if !num.is_empty() {
+                return format!("hash@{}", num);
+            }
+        }
+    }
+    // Lit([0, 0, ..., N]) -> direct_slot
+    if slot_id.starts_with("Lit(") {
+        return "direct_slot".to_string();
+    }
+    // Truncate long names
+    truncate(slot_id)
+}
+
 /// Format algebraic invariants for display.
 pub fn format_algebraic_invariants(invariants: &[AlgebraicInvariant]) -> String {
     let mut out = String::new();
 
-    let proven = invariants
+    let proven: Vec<_> = invariants
         .iter()
         .filter(|i| i.confidence == AlgebraicConfidence::Proven)
-        .count();
-    let likely = invariants
+        .collect();
+    let likely: Vec<_> = invariants
         .iter()
         .filter(|i| i.confidence == AlgebraicConfidence::Likely)
-        .count();
-    let candidate = invariants
+        .collect();
+    let candidate: Vec<_> = invariants
         .iter()
         .filter(|i| i.confidence == AlgebraicConfidence::Candidate)
-        .count();
-    let with_violators: Vec<_> = invariants
+        .collect();
+    let violation_count = invariants
         .iter()
         .filter(|i| !i.violators.is_empty())
-        .collect();
+        .count();
 
     out.push_str(&format!(
         "Mined {} algebraic invariants ({} proven, {} likely, {} candidate)\n",
         invariants.len(),
-        proven,
-        likely,
-        candidate
+        proven.len(),
+        likely.len(),
+        candidate.len()
     ));
-    out.push_str(&format!(
-        "{} potential violations\n\n",
-        with_violators.len()
-    ));
+    out.push_str(&format!("{} potential violations\n", violation_count));
 
-    // Group by type
-    let mut by_name: HashMap<&str, Vec<&AlgebraicInvariant>> = HashMap::new();
+    // Build per-name counts for the summary line
+    let mut name_counts: HashMap<&str, usize> = HashMap::new();
     for inv in invariants {
-        by_name.entry(&inv.name).or_default().push(inv);
+        *name_counts.entry(&inv.name).or_insert(0) += 1;
     }
+    let mut summary_parts: Vec<String> = Vec::new();
+    let mut sorted_names: Vec<&&str> = name_counts.keys().collect();
+    sorted_names.sort();
+    for name in sorted_names {
+        let count = name_counts[*name];
+        summary_parts.push(format!("{} {}", count, name));
+    }
+    if !summary_parts.is_empty() {
+        out.push_str(&format!("Summary: {}\n", summary_parts.join(", ")));
+    }
+    out.push('\n');
 
-    // Sort keys for deterministic output
-    let mut names: Vec<&&str> = by_name.keys().collect();
-    names.sort();
+    // Group by confidence: PROVEN first, then LIKELY, then CANDIDATE
+    let groups: &[(&str, &[&AlgebraicInvariant])] = &[
+        ("PROVEN", &proven),
+        ("LIKELY", &likely),
+        ("CANDIDATE", &candidate),
+    ];
 
-    for name in names {
-        let invs = &by_name[*name];
-        out.push_str(&format!("--- {} ({}) ---\n", name, invs.len()));
-        for inv in invs {
-            let conf = match inv.confidence {
-                AlgebraicConfidence::Proven => "PROVEN",
-                AlgebraicConfidence::Likely => "LIKELY",
-                AlgebraicConfidence::Candidate => "CANDIDATE",
-            };
-            out.push_str(&format!("  [{}] {}\n", conf, inv.description));
+    for (label, invs) in groups {
+        if invs.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("--- {} ({}) ---\n", label, invs.len()));
+        for inv in *invs {
+            out.push_str(&format!("  [{}] {}\n", inv.name, inv.description));
             if !inv.violators.is_empty() {
                 out.push_str(&format!(
                     "    ! Potential violators: {}\n",
@@ -1346,15 +1465,95 @@ mod tests {
         let summary = make_summary("transfer", vec![(slot_a, new_a), (slot_b, new_b)]);
         let invariants = mine_invariants(&[summary]);
 
-        // Should have conservation, monotonicity, and zero-sum at minimum
+        // Should have conservation and zero-sum at minimum; potential_conservation
+        // should be filtered out because conservation/zero_sum_transfer covers transfer().
         assert!(
-            invariants.len() >= 3,
+            invariants.len() >= 2,
             "mine_invariants should produce multiple invariant types, got {}",
             invariants.len()
         );
 
         let names: HashSet<&str> = invariants.iter().map(|i| i.name.as_str()).collect();
         assert!(names.contains("conservation"));
-        assert!(names.contains("zero_sum_transfer") || names.contains("potential_conservation"));
+        assert!(names.contains("zero_sum_transfer"));
+        assert!(
+            !names.contains("potential_conservation"),
+            "potential_conservation should be deduped when zero_sum_transfer exists"
+        );
+    }
+
+    #[test]
+    fn test_bidirectional_balance_detection() {
+        let slot = Expr::Var("balance".into());
+        let amount = Expr::Var("amount".into());
+
+        // deposit: slot += amount
+        let deposit_val = Expr::Add(
+            Box::new(Expr::SLoad(Box::new(slot.clone()))),
+            Box::new(amount.clone()),
+        );
+        let s_deposit = make_summary("deposit", vec![(slot.clone(), deposit_val)]);
+
+        // withdraw: slot -= amount
+        let withdraw_val = Expr::Sub(
+            Box::new(Expr::SLoad(Box::new(slot.clone()))),
+            Box::new(amount.clone()),
+        );
+        let s_withdraw = make_summary("withdraw", vec![(slot, withdraw_val)]);
+
+        let invariants = mine_bidirectional_slots(&[s_deposit, s_withdraw]);
+        assert!(
+            invariants.iter().any(|i| i.name == "bidirectional_balance"),
+            "Should detect bidirectional balance pattern"
+        );
+
+        let inv = invariants
+            .iter()
+            .find(|i| i.name == "bidirectional_balance")
+            .unwrap();
+        assert!(inv.description.contains("deposit"));
+        assert!(inv.description.contains("withdraw"));
+    }
+
+    #[test]
+    fn test_humanize_slot() {
+        assert_eq!(
+            humanize_slot("Keccak256(Var(\"sha3_input@256\"))"),
+            "mapping_entry@256"
+        );
+        assert_eq!(humanize_slot("Var(\"sha3_input@128\")"), "hash@128");
+        assert_eq!(humanize_slot("Lit([0, 0, 0, 1])"), "direct_slot");
+        assert_eq!(humanize_slot("Var(\"slot_0\")"), "Var(\"slot_0\")");
+    }
+
+    #[test]
+    fn test_dedup_potential_conservation() {
+        // When conservation is found, potential_conservation for same function is removed
+        let slot_a = Expr::Var("bal_from".into());
+        let slot_b = Expr::Var("bal_to".into());
+        let amount = Expr::Var("amount".into());
+
+        let new_a = Expr::Sub(
+            Box::new(Expr::SLoad(Box::new(slot_a.clone()))),
+            Box::new(amount.clone()),
+        );
+        let new_b = Expr::Add(
+            Box::new(Expr::SLoad(Box::new(slot_b.clone()))),
+            Box::new(amount.clone()),
+        );
+
+        let summary = make_summary("transfer", vec![(slot_a, new_a), (slot_b, new_b)]);
+        let invariants = mine_invariants(&[summary]);
+
+        // Should NOT contain potential_conservation
+        assert!(
+            !invariants
+                .iter()
+                .any(|i| i.name == "potential_conservation"),
+            "potential_conservation should be removed when conservation exists"
+        );
+        // But should contain conservation and zero_sum_transfer
+        assert!(invariants.iter().any(|i| i.name == "conservation"));
+        assert!(invariants.iter().any(|i| i.name == "zero_sum_transfer"));
     }
 }
