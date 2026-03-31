@@ -123,6 +123,7 @@ pub fn mine_invariants(summaries: &[FunctionSummary]) -> Vec<AlgebraicInvariant>
 
     // Advanced strategies
     invariants.extend(mine_product_invariants(summaries));
+    invariants.extend(mine_ratio_invariants(summaries));
     invariants.extend(mine_mapping_patterns(summaries));
     invariants.extend(mine_overwrite_patterns(summaries));
     invariants.extend(mine_bidirectional_slots(summaries));
@@ -260,18 +261,21 @@ fn mine_monotonicity(summaries: &[FunctionSummary]) -> Vec<AlgebraicInvariant> {
     }
 
     for (slot, (increases, decreases, functions)) in &slot_directions {
+        let mut deduped_fns = functions.clone();
+        deduped_fns.sort();
+        deduped_fns.dedup();
         if *increases && !*decreases {
             invariants.push(AlgebraicInvariant {
                 name: "monotonic_increase".to_string(),
                 description: format!(
                     "Slot {} only increases (never decreases) across functions: {}",
                     humanize_slot(slot),
-                    functions.join(", ")
+                    cap_list(&deduped_fns, 5)
                 ),
                 property: None,
                 confidence: AlgebraicConfidence::Likely,
                 violators: vec![],
-                supporting_functions: functions.clone(),
+                supporting_functions: deduped_fns,
             });
         } else if *decreases && !*increases {
             invariants.push(AlgebraicInvariant {
@@ -279,12 +283,12 @@ fn mine_monotonicity(summaries: &[FunctionSummary]) -> Vec<AlgebraicInvariant> {
                 description: format!(
                     "Slot {} only decreases (never increases) across functions: {}",
                     humanize_slot(slot),
-                    functions.join(", ")
+                    cap_list(&deduped_fns, 5)
                 ),
                 property: None,
                 confidence: AlgebraicConfidence::Likely,
                 violators: vec![],
-                supporting_functions: functions.clone(),
+                supporting_functions: deduped_fns,
             });
         }
     }
@@ -560,6 +564,7 @@ fn mine_mapping_patterns(summaries: &[FunctionSummary]) -> Vec<AlgebraicInvarian
         if entries.len() >= 2 {
             let functions: HashSet<&str> = entries.iter().map(|(_, f)| f.as_str()).collect();
             let unique_slots: HashSet<&str> = entries.iter().map(|(s, _)| s.as_str()).collect();
+            let func_list: Vec<String> = functions.into_iter().map(|s| s.to_string()).collect();
             invariants.push(AlgebraicInvariant {
                 name: "mapping_identified".to_string(),
                 description: format!(
@@ -567,7 +572,7 @@ fn mine_mapping_patterns(summaries: &[FunctionSummary]) -> Vec<AlgebraicInvarian
                      functions: {}. Likely a balances/allowances mapping.",
                     humanize_slot(base),
                     unique_slots.len(),
-                    functions.into_iter().collect::<Vec<_>>().join(", ")
+                    cap_list(&func_list, 5)
                 ),
                 property: None,
                 confidence: AlgebraicConfidence::Likely,
@@ -639,18 +644,80 @@ fn mine_bidirectional_slots(summaries: &[FunctionSummary]) -> Vec<AlgebraicInvar
                     "Slot {} is a balance: increased by {} and decreased by {}. \
                      Deposit/withdraw pattern — verify that withdrawals cannot exceed deposits.",
                     humanize_slot(slot),
-                    increasers.join(", "),
-                    decreasers.join(", ")
+                    cap_list(increasers, 5),
+                    cap_list(decreasers, 5)
                 ),
                 property: None,
                 confidence: AlgebraicConfidence::Likely,
                 violators: vec![],
-                supporting_functions: [increasers.clone(), decreasers.clone()].concat(),
+                supporting_functions: {
+                    let mut fns = [increasers.clone(), decreasers.clone()].concat();
+                    fns.sort();
+                    fns.dedup();
+                    fns
+                },
             });
         }
     }
 
     invariants
+}
+
+/// Mine ratio invariants: detect Div(SLoad(A), SLoad(B)) patterns.
+/// These indicate exchange rate or collateral ratio computations.
+fn mine_ratio_invariants(summaries: &[FunctionSummary]) -> Vec<AlgebraicInvariant> {
+    let mut invariants = Vec::new();
+
+    for summary in summaries {
+        for (_, value) in &summary.writes {
+            let ratios = find_sload_ratios(value);
+            for (slot_a, slot_b) in &ratios {
+                invariants.push(AlgebraicInvariant {
+                    name: "ratio_computation".to_string(),
+                    description: format!(
+                        "{} computes ratio of {} / {}. Likely exchange rate or collateral ratio — verify bounds are enforced.",
+                        summary.name, humanize_slot(slot_a), humanize_slot(slot_b)
+                    ),
+                    property: None,
+                    confidence: AlgebraicConfidence::Candidate,
+                    violators: vec![],
+                    supporting_functions: vec![summary.name.clone()],
+                });
+            }
+        }
+    }
+    dedup_invariants(&mut invariants);
+    invariants
+}
+
+/// Find Div(SLoad(A), SLoad(B)) patterns in an expression tree.
+fn find_sload_ratios(expr: &Expr) -> Vec<(String, String)> {
+    let mut ratios = Vec::new();
+    match expr {
+        Expr::Div(a, b) => {
+            if let (Some(sa), Some(sb)) = (extract_sload_slot(a), extract_sload_slot(b)) {
+                ratios.push((sa, sb));
+            }
+            ratios.extend(find_sload_ratios(a));
+            ratios.extend(find_sload_ratios(b));
+        }
+        Expr::Add(a, b) | Expr::Sub(a, b) | Expr::Mul(a, b) => {
+            ratios.extend(find_sload_ratios(a));
+            ratios.extend(find_sload_ratios(b));
+        }
+        Expr::SLoad(inner) => {
+            ratios.extend(find_sload_ratios(inner));
+        }
+        Expr::Keccak256(inner) => {
+            ratios.extend(find_sload_ratios(inner));
+        }
+        Expr::Ite(_, t, f) => {
+            ratios.extend(find_sload_ratios(t));
+            ratios.extend(find_sload_ratios(f));
+        }
+        _ => {}
+    }
+    ratios
 }
 
 /// Verify mined invariants using Z3.
@@ -719,6 +786,9 @@ fn verify_monotonicity(
         }
     }
 
+    inv.violators.sort();
+    inv.violators.dedup();
+
     if inv.violators.is_empty() && !inv.supporting_functions.is_empty() {
         inv.confidence = AlgebraicConfidence::Proven;
     }
@@ -755,6 +825,9 @@ fn verify_product(
             inv.violators.push(summary.name.clone());
         }
     }
+
+    inv.violators.sort();
+    inv.violators.dedup();
 
     if inv.violators.is_empty() && !inv.supporting_functions.is_empty() {
         inv.confidence = AlgebraicConfidence::Likely;
@@ -930,14 +1003,16 @@ pub fn mine_cross_function_conservation(summaries: &[FunctionSummary]) -> Vec<Al
             .collect();
 
         if !has_delta.is_empty() && !no_delta.is_empty() {
+            let has_delta_s: Vec<String> = has_delta.iter().map(|s| s.to_string()).collect();
+            let no_delta_s: Vec<String> = no_delta.iter().map(|s| s.to_string()).collect();
             invariants.push(AlgebraicInvariant {
                 name: "inconsistent_slot_update".to_string(),
                 description: format!(
                     "Slot {} is incrementally updated by {} but completely \
                      overwritten by {}. The overwriters may break an accumulator invariant.",
                     humanize_slot(slot),
-                    has_delta.join(", "),
-                    no_delta.join(", ")
+                    cap_list(&has_delta_s, 5),
+                    cap_list(&no_delta_s, 5)
                 ),
                 property: None,
                 confidence: AlgebraicConfidence::Candidate,
@@ -956,6 +1031,23 @@ fn dedup_invariants(invariants: &mut Vec<AlgebraicInvariant>) {
         let key = format!("{}:{}", inv.name, inv.description);
         seen.insert(key)
     });
+    // Deduplicate violator and supporting_functions lists within each invariant.
+    for inv in invariants.iter_mut() {
+        inv.violators.sort();
+        inv.violators.dedup();
+        inv.supporting_functions.sort();
+        inv.supporting_functions.dedup();
+    }
+}
+
+/// Cap a list of names at `max` entries, appending "... and N more" if truncated.
+fn cap_list(items: &[String], max: usize) -> String {
+    if items.len() <= max {
+        items.join(", ")
+    } else {
+        let shown: Vec<&str> = items[..max].iter().map(|s| s.as_str()).collect();
+        format!("{} ... and {} more", shown.join(", "), items.len() - max)
+    }
 }
 
 fn truncate(s: &str) -> String {
@@ -1070,7 +1162,7 @@ pub fn format_algebraic_invariants(invariants: &[AlgebraicInvariant]) -> String 
             if !inv.violators.is_empty() {
                 out.push_str(&format!(
                     "    ! Potential violators: {}\n",
-                    inv.violators.join(", ")
+                    cap_list(&inv.violators, 5)
                 ));
             }
         }
