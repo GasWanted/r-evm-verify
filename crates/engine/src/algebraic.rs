@@ -1098,6 +1098,356 @@ fn humanize_slot(slot_id: &str) -> String {
     truncate(slot_id)
 }
 
+// ---------------------------------------------------------------------------
+// State Dependency Graph
+// ---------------------------------------------------------------------------
+
+/// A dependency edge: function A writes to a slot that function B reads.
+#[derive(Debug, Clone)]
+pub struct StateDependency {
+    pub writer: String,
+    pub reader: String,
+    pub slot: String,
+}
+
+/// Build a state dependency graph from function summaries.
+///
+/// Creates directed edges from writer functions to reader functions when they
+/// share a storage slot — the writer SSTOREs to it and the reader SLOADs from
+/// it (in write-value expressions or path conditions).
+pub fn build_dependency_graph(summaries: &[FunctionSummary]) -> Vec<StateDependency> {
+    let mut deps = Vec::new();
+
+    // Collect writes per function
+    let mut writes: HashMap<String, HashSet<String>> = HashMap::new();
+    for summary in summaries {
+        let slots: HashSet<String> = summary
+            .writes
+            .iter()
+            .map(|(slot, _)| format!("{:?}", slot))
+            .collect();
+        writes.insert(summary.name.clone(), slots);
+    }
+
+    // Collect reads per function (SLoad references in write expressions and conditions)
+    let mut reads: HashMap<String, HashSet<String>> = HashMap::new();
+    for summary in summaries {
+        let mut slot_reads = HashSet::new();
+        for (_, value) in &summary.writes {
+            collect_sloads_in_expr(value, &mut slot_reads);
+        }
+        for conditions in &summary.success_conditions {
+            for prop in conditions {
+                collect_sloads_in_prop(prop, &mut slot_reads);
+            }
+        }
+        for conditions in &summary.revert_conditions {
+            for prop in conditions {
+                collect_sloads_in_prop(prop, &mut slot_reads);
+            }
+        }
+        reads.insert(summary.name.clone(), slot_reads);
+    }
+
+    // Build edges: writer -> reader for each shared slot
+    for (writer_name, written_slots) in &writes {
+        for (reader_name, read_slots) in &reads {
+            if writer_name == reader_name {
+                continue;
+            }
+            for slot in written_slots.intersection(read_slots) {
+                deps.push(StateDependency {
+                    writer: writer_name.clone(),
+                    reader: reader_name.clone(),
+                    slot: humanize_slot(slot),
+                });
+            }
+        }
+    }
+
+    deps
+}
+
+fn collect_sloads_in_expr(expr: &Expr, slots: &mut HashSet<String>) {
+    match expr {
+        Expr::SLoad(slot) => {
+            slots.insert(format!("{:?}", slot));
+        }
+        // Binary ops
+        Expr::Add(a, b)
+        | Expr::Sub(a, b)
+        | Expr::Mul(a, b)
+        | Expr::Div(a, b)
+        | Expr::SDiv(a, b)
+        | Expr::Mod(a, b)
+        | Expr::SMod(a, b)
+        | Expr::Exp(a, b)
+        | Expr::And(a, b)
+        | Expr::Or(a, b)
+        | Expr::Eq(a, b)
+        | Expr::Lt(a, b)
+        | Expr::Gt(a, b)
+        | Expr::SLt(a, b)
+        | Expr::SGt(a, b)
+        | Expr::Xor(a, b)
+        | Expr::Shl(a, b)
+        | Expr::Shr(a, b)
+        | Expr::Sar(a, b) => {
+            collect_sloads_in_expr(a, slots);
+            collect_sloads_in_expr(b, slots);
+        }
+        // Ternary ops
+        Expr::AddMod(a, b, c) | Expr::MulMod(a, b, c) => {
+            collect_sloads_in_expr(a, slots);
+            collect_sloads_in_expr(b, slots);
+            collect_sloads_in_expr(c, slots);
+        }
+        // Unary ops
+        Expr::Not(a)
+        | Expr::IsZero(a)
+        | Expr::Keccak256(a)
+        | Expr::MLoad(a)
+        | Expr::CallDataLoad(a)
+        | Expr::Balance(a)
+        | Expr::BlockHash(a) => {
+            collect_sloads_in_expr(a, slots);
+        }
+        // Conditional
+        Expr::Ite(_, t, f) => {
+            collect_sloads_in_expr(t, slots);
+            collect_sloads_in_expr(f, slots);
+        }
+        // Leaves (no children)
+        _ => {}
+    }
+}
+
+fn collect_sloads_in_prop(prop: &Prop, slots: &mut HashSet<String>) {
+    match prop {
+        Prop::IsTrue(e) | Prop::IsZero(e) => collect_sloads_in_expr(e, slots),
+        Prop::Eq(a, b) | Prop::Lt(a, b) | Prop::Gt(a, b) => {
+            collect_sloads_in_expr(a, slots);
+            collect_sloads_in_expr(b, slots);
+        }
+        Prop::And(a, b) | Prop::Or(a, b) => {
+            collect_sloads_in_prop(a, slots);
+            collect_sloads_in_prop(b, slots);
+        }
+        Prop::Not(a) => collect_sloads_in_prop(a, slots),
+        Prop::Bool(_) => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Attack Path Mining
+// ---------------------------------------------------------------------------
+
+/// An attack path: sequence of function calls that may lead to an exploit.
+#[derive(Debug, Clone)]
+pub struct AttackPath {
+    pub sequence: Vec<String>,
+    pub description: String,
+    pub risk: AttackRisk,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttackRisk {
+    /// Unguarded external call after state manipulation
+    Critical,
+    /// State manipulation affecting financial values
+    High,
+    /// Ordering dependency without clear exploit
+    Medium,
+}
+
+/// Mine potential attack paths from the dependency graph.
+///
+/// Recognises two patterns:
+///  1. **Critical** — A writes state, B reads that state and makes an external
+///     call without a caller-based guard. Classic flash-loan / reentrancy via
+///     state manipulation.
+///  2. **High** — A writes state read by B, which in turn writes state read by
+///     C — a 3-hop chain with at least one unguarded link. Unvalidated state
+///     propagation.
+pub fn mine_attack_paths(
+    summaries: &[FunctionSummary],
+    deps: &[StateDependency],
+) -> Vec<AttackPath> {
+    let mut paths = Vec::new();
+
+    // Build lookup sets
+    let has_call: HashSet<&str> = summaries
+        .iter()
+        .filter(|s| s.has_external_call)
+        .map(|s| s.name.as_str())
+        .collect();
+
+    let has_guard: HashSet<&str> = summaries
+        .iter()
+        .filter(|s| {
+            s.revert_conditions
+                .iter()
+                .any(|c| c.iter().any(|p| dep_prop_references_caller(p)))
+                || s.success_conditions
+                    .iter()
+                    .any(|c| c.iter().any(|p| dep_prop_references_caller(p)))
+        })
+        .map(|s| s.name.as_str())
+        .collect();
+
+    // Pattern 1: A writes state -> B reads state and makes external call (without guard)
+    for dep in deps {
+        if has_call.contains(dep.reader.as_str()) && !has_guard.contains(dep.reader.as_str()) {
+            paths.push(AttackPath {
+                sequence: vec![dep.writer.clone(), dep.reader.clone()],
+                description: format!(
+                    "{} modifies {} which {} reads before making an external call (unguarded). \
+                     Potential flash loan or reentrancy via state manipulation.",
+                    dep.writer, dep.slot, dep.reader
+                ),
+                risk: AttackRisk::Critical,
+            });
+        }
+    }
+
+    // Pattern 2: A writes state -> B reads state -> B writes state -> C reads state (chain)
+    for dep1 in deps {
+        for dep2 in deps {
+            if dep1.reader == dep2.writer && dep1.writer != dep2.reader {
+                if !has_guard.contains(dep1.writer.as_str())
+                    || !has_guard.contains(dep2.reader.as_str())
+                {
+                    paths.push(AttackPath {
+                        sequence: vec![
+                            dep1.writer.clone(),
+                            dep1.reader.clone(),
+                            dep2.reader.clone(),
+                        ],
+                        description: format!(
+                            "Chain: {} -> {} -> {} via state dependencies. \
+                             Unvalidated state propagation across 3 functions.",
+                            dep1.writer, dep1.reader, dep2.reader
+                        ),
+                        risk: AttackRisk::High,
+                    });
+                }
+            }
+        }
+    }
+
+    // Deduplicate by sequence
+    let mut seen = HashSet::new();
+    paths.retain(|p| seen.insert(format!("{:?}", p.sequence)));
+
+    // Cap total paths to avoid noise
+    paths.truncate(20);
+    paths
+}
+
+/// Format attack paths for display.
+pub fn format_attack_paths(paths: &[AttackPath]) -> String {
+    let mut out = String::new();
+
+    let critical = paths
+        .iter()
+        .filter(|p| p.risk == AttackRisk::Critical)
+        .count();
+    let high = paths.iter().filter(|p| p.risk == AttackRisk::High).count();
+    let medium = paths
+        .iter()
+        .filter(|p| p.risk == AttackRisk::Medium)
+        .count();
+
+    out.push_str(&format!(
+        "Found {} attack paths ({} critical, {} high, {} medium)\n\n",
+        paths.len(),
+        critical,
+        high,
+        medium
+    ));
+
+    for (i, path) in paths.iter().enumerate() {
+        let risk_label = match path.risk {
+            AttackRisk::Critical => "CRITICAL",
+            AttackRisk::High => "HIGH",
+            AttackRisk::Medium => "MEDIUM",
+        };
+        out.push_str(&format!(
+            "  {}. [{}] {}\n     {}\n\n",
+            i + 1,
+            risk_label,
+            path.sequence.join(" -> "),
+            path.description
+        ));
+    }
+
+    out
+}
+
+/// Check whether a Prop references `Caller` (access control check).
+fn dep_prop_references_caller(prop: &Prop) -> bool {
+    match prop {
+        Prop::Bool(_) => false,
+        Prop::IsTrue(e) | Prop::IsZero(e) => dep_expr_references_caller(e),
+        Prop::Eq(a, b) | Prop::Lt(a, b) | Prop::Gt(a, b) => {
+            dep_expr_references_caller(a) || dep_expr_references_caller(b)
+        }
+        Prop::And(a, b) | Prop::Or(a, b) => {
+            dep_prop_references_caller(a) || dep_prop_references_caller(b)
+        }
+        Prop::Not(a) => dep_prop_references_caller(a),
+    }
+}
+
+fn dep_expr_references_caller(expr: &Expr) -> bool {
+    match expr {
+        Expr::Caller => true,
+        // Binary ops
+        Expr::Add(a, b)
+        | Expr::Sub(a, b)
+        | Expr::Mul(a, b)
+        | Expr::Div(a, b)
+        | Expr::SDiv(a, b)
+        | Expr::Mod(a, b)
+        | Expr::SMod(a, b)
+        | Expr::Exp(a, b)
+        | Expr::Lt(a, b)
+        | Expr::Gt(a, b)
+        | Expr::SLt(a, b)
+        | Expr::SGt(a, b)
+        | Expr::Eq(a, b)
+        | Expr::And(a, b)
+        | Expr::Or(a, b)
+        | Expr::Xor(a, b)
+        | Expr::Shl(a, b)
+        | Expr::Shr(a, b)
+        | Expr::Sar(a, b) => dep_expr_references_caller(a) || dep_expr_references_caller(b),
+        // Ternary
+        Expr::AddMod(a, b, c) | Expr::MulMod(a, b, c) => {
+            dep_expr_references_caller(a)
+                || dep_expr_references_caller(b)
+                || dep_expr_references_caller(c)
+        }
+        // Unary
+        Expr::Not(a)
+        | Expr::IsZero(a)
+        | Expr::SLoad(a)
+        | Expr::Keccak256(a)
+        | Expr::MLoad(a)
+        | Expr::CallDataLoad(a)
+        | Expr::Balance(a)
+        | Expr::BlockHash(a) => dep_expr_references_caller(a),
+        // Conditional
+        Expr::Ite(_, t, f) => dep_expr_references_caller(t) || dep_expr_references_caller(f),
+        // Leaves
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Formatting
+// ---------------------------------------------------------------------------
+
 /// Format algebraic invariants for display.
 pub fn format_algebraic_invariants(invariants: &[AlgebraicInvariant]) -> String {
     let mut out = String::new();
@@ -1647,5 +1997,232 @@ mod tests {
         // But should contain conservation and zero_sum_transfer
         assert!(invariants.iter().any(|i| i.name == "conservation"));
         assert!(invariants.iter().any(|i| i.name == "zero_sum_transfer"));
+    }
+
+    // -------------------------------------------------------------------
+    // Tests for state dependency graph and attack path mining
+    // -------------------------------------------------------------------
+
+    fn make_full_summary(
+        name: &str,
+        writes: Vec<(Expr, Expr)>,
+        has_external_call: bool,
+        revert_conditions: Vec<Vec<Prop>>,
+        success_conditions: Vec<Vec<Prop>>,
+    ) -> FunctionSummary {
+        let modifies_storage = !writes.is_empty();
+        FunctionSummary {
+            name: name.to_string(),
+            preconditions: vec![],
+            reads: vec![],
+            writes,
+            has_external_call,
+            modifies_storage,
+            revert_conditions,
+            success_conditions,
+        }
+    }
+
+    #[test]
+    fn test_dependency_graph_basic() {
+        let slot = Expr::Var("balance".into());
+        let amount = Expr::Var("amount".into());
+
+        // deposit writes to slot
+        let deposit_val = Expr::Add(
+            Box::new(Expr::SLoad(Box::new(slot.clone()))),
+            Box::new(amount.clone()),
+        );
+        let s_deposit = make_summary("deposit", vec![(slot.clone(), deposit_val)]);
+
+        // withdraw reads from slot (via SLoad in its new value expression)
+        let withdraw_val = Expr::Sub(
+            Box::new(Expr::SLoad(Box::new(slot.clone()))),
+            Box::new(amount.clone()),
+        );
+        let s_withdraw = make_summary("withdraw", vec![(slot, withdraw_val)]);
+
+        let deps = build_dependency_graph(&[s_deposit, s_withdraw]);
+
+        // deposit writes slot, withdraw reads slot => edge deposit->withdraw
+        assert!(
+            deps.iter()
+                .any(|d| d.writer == "deposit" && d.reader == "withdraw"),
+            "Should have dependency edge from deposit to withdraw"
+        );
+        // withdraw writes slot, deposit reads slot => edge withdraw->deposit
+        assert!(
+            deps.iter()
+                .any(|d| d.writer == "withdraw" && d.reader == "deposit"),
+            "Should have dependency edge from withdraw to deposit"
+        );
+    }
+
+    #[test]
+    fn test_dependency_graph_no_self_edges() {
+        let slot = Expr::Var("counter".into());
+        let new_val = Expr::Add(
+            Box::new(Expr::SLoad(Box::new(slot.clone()))),
+            Box::new(Expr::Var("x".into())),
+        );
+        let s = make_summary("increment", vec![(slot, new_val)]);
+
+        let deps = build_dependency_graph(&[s]);
+
+        assert!(
+            deps.is_empty(),
+            "Single function should produce no dependency edges (no self-edges)"
+        );
+    }
+
+    #[test]
+    fn test_attack_path_critical_unguarded_call() {
+        let slot = Expr::Var("balance".into());
+        let amount = Expr::Var("amount".into());
+
+        // deposit: writes balance slot
+        let deposit_val = Expr::Add(
+            Box::new(Expr::SLoad(Box::new(slot.clone()))),
+            Box::new(amount.clone()),
+        );
+        let s_deposit = make_summary("deposit", vec![(slot.clone(), deposit_val)]);
+
+        // flashLoan: reads balance slot (in write expr), has external call, no guard
+        let loan_val = Expr::Sub(
+            Box::new(Expr::SLoad(Box::new(slot.clone()))),
+            Box::new(amount.clone()),
+        );
+        let s_loan = make_full_summary(
+            "flashLoan",
+            vec![(slot, loan_val)],
+            true,   // has_external_call
+            vec![], // no revert conditions (unguarded)
+            vec![],
+        );
+
+        let summaries = vec![s_deposit, s_loan];
+        let deps = build_dependency_graph(&summaries);
+        let paths = mine_attack_paths(&summaries, &deps);
+
+        assert!(
+            paths.iter().any(|p| p.risk == AttackRisk::Critical
+                && p.sequence.contains(&"deposit".to_string())
+                && p.sequence.contains(&"flashLoan".to_string())),
+            "Should find critical attack path: deposit -> flashLoan (unguarded external call)"
+        );
+    }
+
+    #[test]
+    fn test_attack_path_guarded_not_critical() {
+        let slot = Expr::Var("balance".into());
+        let amount = Expr::Var("amount".into());
+
+        // deposit: writes balance slot
+        let deposit_val = Expr::Add(
+            Box::new(Expr::SLoad(Box::new(slot.clone()))),
+            Box::new(amount.clone()),
+        );
+        let s_deposit = make_summary("deposit", vec![(slot.clone(), deposit_val)]);
+
+        // guarded_fn: reads balance, has external call, but IS guarded by caller check
+        let guarded_val = Expr::Sub(
+            Box::new(Expr::SLoad(Box::new(slot.clone()))),
+            Box::new(amount.clone()),
+        );
+        let caller_guard = Prop::Eq(
+            Box::new(Expr::Caller),
+            Box::new(Expr::SLoad(Box::new(Expr::Var("owner_slot".into())))),
+        );
+        let s_guarded = make_full_summary(
+            "guarded_fn",
+            vec![(slot, guarded_val)],
+            true, // has_external_call
+            vec![vec![caller_guard]],
+            vec![],
+        );
+
+        let summaries = vec![s_deposit, s_guarded];
+        let deps = build_dependency_graph(&summaries);
+        let paths = mine_attack_paths(&summaries, &deps);
+
+        // Should NOT have a critical path since guarded_fn has a caller guard
+        assert!(
+            !paths.iter().any(|p| p.risk == AttackRisk::Critical
+                && p.sequence.contains(&"guarded_fn".to_string())),
+            "Guarded function should not appear in critical attack paths"
+        );
+    }
+
+    #[test]
+    fn test_attack_path_chain() {
+        let slot_a = Expr::Var("slot_a".into());
+        let slot_b = Expr::Var("slot_b".into());
+        let x = Expr::Var("x".into());
+
+        // fn_a writes slot_a
+        let a_val = Expr::Add(
+            Box::new(Expr::SLoad(Box::new(slot_a.clone()))),
+            Box::new(x.clone()),
+        );
+        let s_a = make_summary("fn_a", vec![(slot_a.clone(), a_val)]);
+
+        // fn_b reads slot_a (SLoad in its expression), writes slot_b
+        let b_val = Expr::Mul(
+            Box::new(Expr::SLoad(Box::new(slot_a))),
+            Box::new(Expr::SLoad(Box::new(slot_b.clone()))),
+        );
+        let s_b = make_summary("fn_b", vec![(slot_b.clone(), b_val)]);
+
+        // fn_c reads slot_b
+        let c_val = Expr::Add(Box::new(Expr::SLoad(Box::new(slot_b))), Box::new(x));
+        let s_c = make_summary("fn_c", vec![(Expr::Var("out".into()), c_val)]);
+
+        let summaries = vec![s_a, s_b, s_c];
+        let deps = build_dependency_graph(&summaries);
+        let paths = mine_attack_paths(&summaries, &deps);
+
+        // Should find a chain fn_a -> fn_b -> fn_c
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.risk == AttackRisk::High && p.sequence.len() == 3),
+            "Should find a 3-hop chain attack path"
+        );
+    }
+
+    #[test]
+    fn test_collect_sloads_in_expr() {
+        let slot = Expr::Var("my_slot".into());
+        let expr = Expr::Add(
+            Box::new(Expr::SLoad(Box::new(slot.clone()))),
+            Box::new(Expr::Lit([0; 32])),
+        );
+
+        let mut slots = HashSet::new();
+        collect_sloads_in_expr(&expr, &mut slots);
+        assert_eq!(slots.len(), 1);
+        assert!(slots.contains(&format!("{:?}", slot)));
+    }
+
+    #[test]
+    fn test_format_attack_paths() {
+        let paths = vec![
+            AttackPath {
+                sequence: vec!["deposit".into(), "flashLoan".into()],
+                description: "Test description".into(),
+                risk: AttackRisk::Critical,
+            },
+            AttackPath {
+                sequence: vec!["a".into(), "b".into(), "c".into()],
+                description: "Chain test".into(),
+                risk: AttackRisk::High,
+            },
+        ];
+        let output = format_attack_paths(&paths);
+        assert!(output.contains("2 attack paths"));
+        assert!(output.contains("1 critical"));
+        assert!(output.contains("1 high"));
+        assert!(output.contains("CRITICAL"));
+        assert!(output.contains("HIGH"));
     }
 }

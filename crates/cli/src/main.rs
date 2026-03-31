@@ -217,6 +217,18 @@ fn cmd_mine(path: PathBuf) -> Result<()> {
     let output = r_evm_verify_engine::algebraic::format_algebraic_invariants(&invariants);
     println!("{}", output);
 
+    // Dependency graph and attack paths
+    let deps = r_evm_verify_engine::algebraic::build_dependency_graph(&summaries);
+    let attack_paths = r_evm_verify_engine::algebraic::mine_attack_paths(&summaries, &deps);
+
+    if !deps.is_empty() {
+        eprintln!("  {} state dependencies found", deps.len());
+    }
+    if !attack_paths.is_empty() {
+        let path_output = r_evm_verify_engine::algebraic::format_attack_paths(&attack_paths);
+        println!("{}", path_output);
+    }
+
     Ok(())
 }
 
