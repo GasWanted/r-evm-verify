@@ -2,11 +2,23 @@
 
 ## [Unreleased]
 
-### Added — Advanced Algebraic Mining (in progress)
-- Product invariants (reserve0 * reserve1 >= k)
-- Z3 verification of mined candidates
-- Mapping aggregation (recognize keccak slot patterns)
-- Complete overwrite analysis
+### Added — Algebraic Mining v2
+- Product invariants (Mul(SLoad, SLoad) patterns → AMM constant-product)
+- Ratio invariants (Div(SLoad, SLoad) → exchange rate/collateral ratio)
+- Z3 verification — candidates promoted from Likely to Proven
+- Mapping slot recognition (keccak base slot grouping)
+- Complete overwrite analysis (consistent vs inconsistent expression shapes)
+- Bidirectional balance detection (deposit/withdraw on same slot)
+- State dependency graph (function→slot→function edges)
+- Attack path mining (state manipulation → unguarded external call sequences)
+- Humanized slot names (mapping_entry@N instead of Keccak256(...))
+- Capped violator lists, deduplicated function names
+
+### Stats
+- 162 tests
+- 10 algebraic mining strategies
+- UnstoppableVault: 20 critical attack paths from 108 state dependencies
+- SimpleToken: conservation invariant PROVEN via Z3
 
 ## [0.1.0] — 2026-03-31
 
