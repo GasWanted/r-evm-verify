@@ -1,0 +1,33 @@
+# Build
+/target/
+/dist/
+/build/
+
+# Dependencies
+/node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+
+# Logs
+*.log
+
+# Superpowers
+docs/superpowers/
+bench/halmos/lib/
+bench/halmos/out/
+bench/halmos/cache/
+ipor-fusion/
+ipor-protocol/
