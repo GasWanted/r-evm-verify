@@ -1595,6 +1595,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
+ "z3",
 ]
 
 [[package]]

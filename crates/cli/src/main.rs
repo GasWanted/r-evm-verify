@@ -229,6 +229,15 @@ fn cmd_mine(path: PathBuf) -> Result<()> {
         println!("{}", path_output);
     }
 
+    // Inductive Z3 verification
+    eprintln!("Running inductive Z3 verification...");
+    let inductive_results = r_evm_verify_engine::inductive::run_inductive_verification(&summaries);
+    if !inductive_results.is_empty() {
+        let inductive_output =
+            r_evm_verify_engine::inductive::format_inductive_results(&inductive_results);
+        println!("{}", inductive_output);
+    }
+
     Ok(())
 }
 
